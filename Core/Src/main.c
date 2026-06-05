@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "ws2812b.h"
+#include "tmf8829.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,7 +51,11 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+volatile int      g_init_ret;       // TMF8829_Init result
+volatile int      g_cfg_ret;        // TMF8829_Configure result
+volatile int      g_poll_ret;       // last TMF8829_Poll return
+volatile uint32_t g_frame_count;    // frames received
+volatile uint32_t g_last_frame_size;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -104,21 +110,41 @@ int main(void)
   MX_ADC1_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
+  // Enable ITM for SWD output (Window → Show View → SWV ITM Data Console, channel 0)
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  ITM->LAR  = 0xC5ACCE55;
+  ITM->TCR  = 0x00010005;
+  ITM->TER  = 0x01;
 
+  TMF8829_DMA_Init();          // GPDMA1 channels for SPI1 (bulk frame reads)
+
+  g_init_ret = TMF8829_Init();
+  if (g_init_ret != 0) Error_Handler();
+
+  g_cfg_ret = TMF8829_Configure_48x32_15fps();
+  if (g_cfg_ret != 0) Error_Handler();
+
+  TMF8829_EXTI_Init();         // PB6 INT (falling-edge) drives frame reads
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-//    uint8_t tx = 0xFF;
-//    HAL_UART_Transmit(&huart1, &tx, 1, HAL_MAX_DELAY);
-//    HAL_Delay(1);
-    for (int i = 0; i < WS_NUM_LEDS; i++) {
-      ws2812b_clear();
-      ws2812b_set_pixel(i, 255, 0, 0);
-      ws2812b_show();
-      HAL_Delay(100);
+    // The TMF8829 INT line is level-active (held low while a result waits).
+    // The PB6 falling-edge EXTI gives a prompt wake-up, but if a new frame
+    // asserts INT before the line returns high from clearing the previous one
+    // the high->low transition never happens and the edge is missed.  So we
+    // service whenever the INT level is low OR an edge was latched, and drain
+    // every pending frame.  The level check makes a permanent miss impossible.
+    tmf8829_loop_iters++;
+    if (tmf8829_frame_pending ||
+        HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_6) == GPIO_PIN_RESET) {
+        tmf8829_frame_pending = 0;
+        do {
+            g_poll_ret = TMF8829_ReadFrame();
+            if (g_poll_ret == 1) g_frame_count++;
+        } while (g_poll_ret == 1);
     }
     /* USER CODE END WHILE */
 
@@ -263,7 +289,7 @@ static void MX_SPI1_Init(void)
   hspi1.Instance = SPI1;
   hspi1.Init.Mode = SPI_MODE_MASTER;
   hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_4BIT;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_HARD_OUTPUT;
@@ -287,7 +313,9 @@ static void MX_SPI1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN SPI1_Init 2 */
-
+  hspi1.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi1.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_ENABLE;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK) Error_Handler();
   /* USER CODE END SPI1_Init 2 */
 
 }
@@ -481,7 +509,12 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+int __io_putchar(int ch)
+{
+    while (ITM->PORT[0].u32 == 0);
+    ITM->PORT[0].u8 = (uint8_t)ch;
+    return ch;
+}
 /* USER CODE END 4 */
 
 /**
